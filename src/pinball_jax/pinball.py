@@ -32,9 +32,10 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from pinball_jax.gym_env import DiscreteActionSpace, ObservationSpace
+from pinball_jax.gym_env import DiscreteActionSpace, ContinuousActionSpace, ObservationSpace
 
 OBSERVATION_SHAPE = (4,)
+CONT_ACTION_SHAPE = (2,)
 NUM_ACTIONS = 5
 DEFAULT_MAX_STEPS_IN_EPISODE = 1000
 
@@ -77,6 +78,15 @@ class _PinballActionSpace:
     @property
     def n(self) -> int:
         return NUM_ACTIONS
+
+class _PinballContActionSpace:
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return CONT_ACTION_SHAPE
+
+    @property
+    def dtype(self) -> jnp.dtype:
+        return jnp.float32
 
 
 # --------------------------------------------------------------------------- #
@@ -396,3 +406,67 @@ class Pinball:
         info: dict[str, jax.Array] = {}
 
         return obs, next_state, reward, terminated, truncated, info
+
+
+class PinballContinuous(Pinball):
+    def _take_action(self, state, action):
+        """Run one action (``SUBSTEPS`` physics substeps) from ``state``."""
+        r = self.ball_rad
+        impulse = action.astype(r.dtype)  # [2]
+
+        def body(i, carry):
+            x, y, xdot, ydot, done = carry
+            was_done = done
+
+            # Impulse (clipped) only on the first substep.
+            imp_x = jnp.clip(xdot + impulse[0] / 5.0, -1.0, 1.0)
+            imp_y = jnp.clip(ydot + impulse[1] / 5.0, -1.0, 1.0)
+            xdot_i = jnp.where(i == 0, imp_x, xdot)
+            ydot_i = jnp.where(i == 0, imp_y, ydot)
+
+            # Move the ball by one increment.
+            x1 = x + xdot_i * r / 20.0
+            y1 = y + ydot_i * r / 20.0
+
+            new_vel, ncollision = self._resolve_collision(
+                jnp.stack([x1, y1]), jnp.stack([xdot_i, ydot_i])
+            )
+            nvx, nvy = new_vel[0], new_vel[1]
+
+            # On the final substep, a single collision triggers an extra move.
+            extra = (i == SUBSTEPS - 1) & (ncollision == 1)
+            x2 = jnp.where(extra, x1 + nvx * r / 20.0, x1)
+            y2 = jnp.where(extra, y1 + nvy * r / 20.0, y1)
+
+            dx, dy = x2 - self.target[0], y2 - self.target[1]
+            ended = jnp.sqrt(dx**2 + dy**2) < self.target_rad
+
+            # Freeze all updates once the episode has ended.
+            x_out = jnp.where(was_done, x, x2)
+            y_out = jnp.where(was_done, y, y2)
+            vx_out = jnp.where(was_done, xdot, nvx)
+            vy_out = jnp.where(was_done, ydot, nvy)
+            done_out = was_done | ended
+            return (x_out, y_out, vx_out, vy_out, done_out)
+
+        carry0 = (state.x, state.y, state.xdot, state.ydot, jnp.asarray(False))
+        x, y, xdot, ydot, done = jax.lax.fori_loop(0, SUBSTEPS, body, carry0)
+
+        # Drag and boundary clamping, skipped if the episode ended (the
+        # reference early-returns before applying them).
+        xdot = jnp.where(done, xdot, xdot * DRAG)
+        ydot = jnp.where(done, ydot, ydot * DRAG)
+        bx = jnp.where(x > 1.0, 0.95, jnp.where(x < 0.0, 0.05, x))
+        by = jnp.where(y > 1.0, 0.95, jnp.where(y < 0.0, 0.05, y))
+        x = jnp.where(done, x, bx)
+        y = jnp.where(done, y, by)
+
+        return PinballState(x=x, y=y, xdot=xdot, ydot=ydot, timestep=state.timestep)
+
+    def action_space(
+            self, params: PinballParams | None = None
+        ) -> ContinuousActionSpace:
+            """Returns the space describing valid actions."""
+            del params
+            return _PinballContActionSpace()
+        

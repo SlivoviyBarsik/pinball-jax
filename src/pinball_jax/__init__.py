@@ -1,4 +1,4 @@
-from pinball_jax.pinball import Pinball, PinballParams, PinballState
+from pinball_jax.pinball import Pinball, PinballContinuous, PinballParams, PinballState
 from pinball_jax.wrappers import AutoresetMode, AutoresetState, AutoresetWrapper
 
 __all__ = [
@@ -6,6 +6,7 @@ __all__ = [
     "AutoresetState",
     "AutoresetWrapper",
     "Pinball",
+    "PinballContinuous",
     "PinballParams",
     "PinballState",
 ]
