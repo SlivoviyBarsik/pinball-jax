@@ -151,3 +151,68 @@ def test_vmap_over_batch(key: jax.Array) -> None:
     assert reward.shape == (8,)
     assert terminated.shape == (8,)
     assert bool(jnp.all(states2.timestep == 1))
+
+
+# --------------------------------------------------------------------------- #
+# in_collision
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("config", CONFIGS)
+def test_in_collision_start_point_is_valid(config: str) -> None:
+    """Every bundled config's own designated start point must not itself be
+    flagged as colliding -- otherwise the config is malformed."""
+    env = Pinball(config)
+    assert not bool(env.in_collision(env.start_pts[0]))
+
+
+def test_in_collision_on_obstacle_vertex() -> None:
+    # easy.cfg: "polygon 0.45 0.392 0.614 0.258 0.734 0.438" -- a vertex of
+    # this triangle lies exactly on an obstacle edge.
+    env = Pinball("easy")
+    assert bool(env.in_collision(jnp.array([0.45, 0.392])))
+
+
+def test_in_collision_false_away_from_obstacle() -> None:
+    env = Pinball("easy")
+    # Away from the triangle vertex in -y specifically: "easy" is dense
+    # enough that +y from this same vertex lands inside a different,
+    # unrelated obstacle's interior (a complex/concave polygon) -- a
+    # real collision in_collision is now expected to catch, now that it
+    # checks polygon interior (not just edge proximity).
+    point = jnp.array([0.45, 0.392]) - jnp.array([0.0, env.ball_rad * 5])
+    assert not bool(env.in_collision(point))
+
+
+def test_in_collision_true_deep_inside_obstacle_interior() -> None:
+    """Regression guard: in_collision used to only check distance to an
+    obstacle's edges, missing a point sitting deep in its interior (more
+    than ball_rad from every edge) -- e.g. a reset position rejection-
+    sampled as "valid" that actually lands solidly inside a large enough
+    obstacle. easy.cfg's triangle ("polygon 0.45 0.392 0.614 0.258 0.734
+    0.438") is big enough that its centroid is one such point."""
+    env = Pinball("easy")
+    centroid = jnp.array([(0.45 + 0.614 + 0.734) / 3, (0.392 + 0.258 + 0.438) / 3])
+    assert bool(env.in_collision(centroid))
+
+
+def test_in_collision_detects_boundary_wall() -> None:
+    env = Pinball("empty")
+    # Just inside the domain but within ball_rad of the left boundary wall.
+    point = jnp.array([float(env.ball_rad) * 0.5, 0.5])
+    assert bool(env.in_collision(point))
+
+
+def test_in_collision_batched_shape() -> None:
+    env = Pinball("easy")
+    points = jnp.stack([env.start_pts[0], jnp.array([0.45, 0.392])])
+    result = env.in_collision(points)
+    assert result.shape == (2,)
+    assert result.tolist() == [False, True]
+
+
+def test_in_collision_jit_compatible(key: jax.Array) -> None:
+    env = Pinball("easy")
+    fn = jax.jit(env.in_collision)
+    assert bool(fn(env.start_pts[0])) is False
+    assert bool(fn(jnp.array([0.45, 0.392]))) is True

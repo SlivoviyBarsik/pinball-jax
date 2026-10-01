@@ -308,6 +308,59 @@ class Pinball:
         )
         return new_vel, ncollision
 
+    def in_collision(self, pos: jax.Array) -> jax.Array:
+        """
+        Returns True where ``pos`` (..., 2) lies within ``ball_rad`` of any
+        obstacle edge, OR strictly inside an obstacle's interior -- i.e. a
+        ball centered there already overlaps a wall. The edge-proximity
+        check alone misses a point sitting deep inside a (sufficiently
+        large) obstacle, more than ``ball_rad`` from every one of its
+        edges, so it's paired with a point-in-polygon test (even-odd
+        crossing number, respecting ``edge_mask`` padding).
+
+        Unlike ``_resolve_collision`` (which additionally gates on velocity
+        direction, since it resolves a collision *response* mid-motion),
+        this depends only on position, so it's suitable for validating a
+        static candidate point -- e.g. a reset/start position -- before any
+        motion has occurred.
+        """
+        r = self.ball_rad
+
+        edge = self.edge_p1 - self.edge_p0                       # [O, E, 2]
+        diff = pos[..., None, None, :] - self.edge_p0            # [..., O, E, 2]
+        denom = jnp.sum(edge * edge, axis=-1)                    # [O, E]
+        safe_denom = jnp.where(denom > 0, denom, 1.0)
+        scalar_proj = jnp.clip(
+            jnp.sum(diff * edge, axis=-1) / safe_denom, 0.0, 1.0
+        )                                                         # [..., O, E]
+        closest = self.edge_p0 + edge * scalar_proj[..., None]    # [..., O, E, 2]
+        dist2 = jnp.sum((pos[..., None, None, :] - closest) ** 2, axis=-1)
+        within = dist2 <= r * r                                  # [..., O, E]
+
+        bbox_pass = (
+            (pos[..., None, 0] - r <= self.bbox_max[:, 0])
+            & (pos[..., None, 0] + r >= self.bbox_min[:, 0])
+            & (pos[..., None, 1] - r <= self.bbox_max[:, 1])
+            & (pos[..., None, 1] + r >= self.bbox_min[:, 1])
+        )                                                         # [..., O]
+
+        edge_hit = within & self.edge_mask & bbox_pass[..., None]  # [..., O, E]
+        near_edge = jnp.any(edge_hit, axis=-1)                      # [..., O]
+
+        # Even-odd point-in-polygon test: cast a ray from `pos` in +x and
+        # count how many (masked-in) edges it crosses; odd -> inside.
+        x = pos[..., None, None, 0]                                 # [..., 1, 1]
+        y = pos[..., None, None, 1]
+        y0 = self.edge_p0[..., 1]                                   # [O, E]
+        y1 = self.edge_p1[..., 1]                                   # [O, E]
+        straddles = ((y0 > y) != (y1 > y)) & self.edge_mask         # [..., O, E]
+        dy = jnp.where((y1 - y0) != 0, y1 - y0, 1.0)
+        x_intersect = self.edge_p0[..., 0] + (y - y0) * edge[..., 0] / dy
+        crosses = straddles & (x < x_intersect)                     # [..., O, E]
+        inside = (jnp.sum(crosses, axis=-1) % 2) == 1               # [..., O]
+
+        return jnp.any(near_edge | inside, axis=-1)
+
     def _take_action(self, state: PinballState, action: jax.Array) -> PinballState:
         """Run one action (``SUBSTEPS`` physics substeps) from ``state``."""
         r = self.ball_rad
@@ -469,4 +522,18 @@ class PinballContinuous(Pinball):
             """Returns the space describing valid actions."""
             del params
             return _PinballContActionSpace()
-        
+
+    def reset(self, key, params = None, start_xy = None):
+        if start_xy is None:
+            return super().reset(key, params)
+
+        del params
+
+        x, y = start_xy[0], start_xy[1]
+            
+        zero = jnp.zeros((), dtype=self.start_pts.dtype)
+        state = PinballState(
+            x=x, y=y, xdot=zero, ydot=zero, timestep=jnp.zeros((), dtype=jnp.int32)
+        )
+        obs = jnp.stack([x, y, zero, zero]).astype(jnp.float32)
+        return obs, state
